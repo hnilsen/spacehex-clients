@@ -39,19 +39,19 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
     // Check if we're close to the goal
     val isCloseToGoal = distanceToGoal < 50.0
     val isVeryCloseToGoal = distanceToGoal < 10.0
-    val isExtremelyCloseToGoal = distanceToGoal < 5.0
+    val isExtremelyCloseToGoal = distanceToGoal < 5.0  // Changed to 5.0 to match the requirement
 
     // Log current status for debugging
     logger.info("Distance to goal: $distanceToGoal, Speed: $currentSpeed, Position: ${lander.position}, Velocity: ${lander.velocity}")
 
     // Calculate desired velocity based on distance to goal
-    // We want to slow down as we approach the goal
+    // We want to slow down as we approach the goal but move faster when far away
     val maxSpeed = when {
         isExtremelyCloseToGoal -> 1.0 // Very slow when extremely close
         isVeryCloseToGoal -> 1.5 // Slower than the 2.0 requirement to give some margin
-        isCloseToGoal -> 2.0 + distanceToGoal / 10.0 // Gradually slow down
-        distanceToGoal < 150.0 -> 10.0 + distanceToGoal / 15.0 // Medium speed at medium distance
-        else -> 25.0 // Maximum speed when far from goal
+        isCloseToGoal -> 3.0 + distanceToGoal / 8.0 // Gradually slow down, but slightly faster
+        distanceToGoal < 150.0 -> 15.0 + distanceToGoal / 10.0 // Increased medium speed
+        else -> 40.0 // Increased maximum speed when far from goal
     }
 
     // Calculate desired velocity vector
@@ -125,13 +125,17 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
         directionToGoal
     }
 
+    // Apply precise hover control when close to goal and not moving too fast
+    val hoverMode = (isVeryCloseToGoal && currentSpeed < 4.0) || isExtremelyCloseToGoal
+
     // Calculate gravity compensation factor
     // Full compensation when hovering, partial when moving
     val gravityCompFactor = when {
-        isExtremelyCloseToGoal -> 1.0 // Full compensation when extremely close
-        isVeryCloseToGoal -> 0.9 // Almost full compensation when very close
-        isCloseToGoal -> 0.7 // Partial compensation when close
-        else -> 0.5 // Minimal compensation when far
+        hoverMode -> 2.0 // Overcompensate when in hover mode to ensure stable hovering
+        isExtremelyCloseToGoal -> 1.5 // Full compensation when extremely close
+        isVeryCloseToGoal -> 1.0 // Almost full compensation when very close
+        isCloseToGoal -> 1.0 // Increased partial compensation when close
+        else -> 1.0 // Increased minimal compensation when far
     }
 
     // Gravity compensation threshold - apply upward thrust when falling faster than this
@@ -148,15 +152,20 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
     val needRightAcceleration = velocityError.x > 0.5 || // Need to go right faster
                                (lander.velocity.x < -0.5 && isCloseToGoal && directionToGoal.x > 0.2) // Moving left but need to go right
 
-    // Apply precise hover control when very close to goal
-    val hoverMode = isVeryCloseToGoal && currentSpeed < 3.0
-
     // In hover mode, apply more precise control
     val (up, left, right) = if (hoverMode) {
-        // Precise hover control
-        val preciseUp = lander.velocity.y < 0.5 // Apply thrust when falling or not rising fast enough
-        val preciseLeft = lander.velocity.x > 0.2 || (lander.position.x > env.goal.x + 1.0) // Apply left when moving right or right of goal
-        val preciseRight = lander.velocity.x < -0.2 || (lander.position.x < env.goal.x - 1.0) // Apply right when moving left or left of goal
+        // Precise hover control - more aggressive to maintain position
+        // Apply upward thrust more aggressively to counteract gravity
+        val preciseUp = lander.velocity.y < 1.0 || 
+                        (isExtremelyCloseToGoal && lander.position.y < env.goal.y) ||
+                        (lander.position.y < env.goal.y - 1.0)
+
+        // More aggressive horizontal control
+        val preciseLeft = lander.velocity.x > 0.1 || 
+                         (lander.position.x > env.goal.x + 0.5) // More sensitive to position
+
+        val preciseRight = lander.velocity.x < -0.1 || 
+                          (lander.position.x < env.goal.x - 0.5) // More sensitive to position
 
         Triple(preciseUp, preciseLeft, preciseRight)
     } else {
