@@ -4,8 +4,17 @@ import no.sonat.game.geometry.LineSegment2D
 import no.sonat.game.geometry.Vec2D
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import kotlin.math.abs
 
 val logger: Logger = LoggerFactory.getLogger("Main")
+
+// Tracking variables to maintain state between function calls
+var previousAcceleration = Acceleration(up = false, left = false, right = false)
+var previousVelocity = Vec2D.ZERO
+var approachFromAbove = false
+var accelerationHistory = mutableListOf<Acceleration>()
+var velocityHistory = mutableListOf<Vec2D>()
+const val HISTORY_SIZE = 5 // Number of previous states to track
 
 fun main() {
     logger.info("Start client")
@@ -31,7 +40,19 @@ fun main() {
 fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
     // If the lander has crashed or completed, don't do anything
     if (lander.status != LanderStatus.FLYING) {
+        // Reset tracking variables
+        previousAcceleration = Acceleration(up = false, left = false, right = false)
+        previousVelocity = Vec2D.ZERO
+        approachFromAbove = false
+        accelerationHistory.clear()
+        velocityHistory.clear()
         return Acceleration(up = false, left = false, right = false)
+    }
+
+    // Update tracking variables
+    velocityHistory.add(lander.velocity)
+    if (velocityHistory.size > HISTORY_SIZE) {
+        velocityHistory.removeAt(0)
     }
 
     // Calculate vector to goal
@@ -39,34 +60,122 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
     val distanceToGoal = toGoal.length()
 
     // Calculate safe landing parameters
-    val maxSafeLandingVelocity = 10.0 // Maximum safe landing velocity
-    val approachDistance = 50.0 // Distance to start slowing down for landing
+    val maxSafeLandingVelocity = 2.5 // Maximum safe landing velocity (2.5 GU/second)
+    val approachDistance = 5.0 // Distance to start slowing down for landing (5 GU)
+    val preApproachDistance = 20.0 // Distance to start positioning above the goal
 
-    // Check if we're close to the goal and need to slow down for landing
-    val needToSlowDown = distanceToGoal < approachDistance && 
-                         lander.velocity.length() > maxSafeLandingVelocity
+    // Calculate average velocity to smooth control
+    val averageVelocity = if (velocityHistory.isNotEmpty()) {
+        velocityHistory.reduce { acc, vel -> acc + vel } / velocityHistory.size.toDouble()
+    } else {
+        lander.velocity
+    }
+
+    val currentSpeed = averageVelocity.length()
+
+    // Determine if we should approach from above
+    if (distanceToGoal < preApproachDistance && !approachFromAbove) {
+        approachFromAbove = true
+    }
 
     // Check for obstacles in the path
     val obstacleAvoidanceVector = calculateObstacleAvoidance(env, lander)
 
-    // Determine desired direction (combining goal direction and obstacle avoidance)
+    // Determine desired direction based on approach strategy and obstacles
     val desiredDirection = if (obstacleAvoidanceVector != Vec2D.ZERO) {
         // If there's an obstacle, prioritize avoiding it
         (toGoal.unit() + obstacleAvoidanceVector * 2.0).unit()
+    } else if (approachFromAbove && lander.position.y < env.goal.y && distanceToGoal > approachDistance) {
+        // If we're below the goal and not in final approach, aim above the goal
+        val aboveGoal = Vec2D(env.goal.x, env.goal.y + 5.0)
+        (aboveGoal - lander.position).unit()
     } else {
         // Otherwise head straight for the goal
         toGoal.unit()
     }
 
-    // Determine acceleration based on desired direction and current velocity
-    val up = (desiredDirection.y > 0 && lander.velocity.y < 20.0) || // Accelerate up if we need to go up
-             (lander.velocity.y < -10.0) || // Counter gravity if falling too fast
-             (needToSlowDown && lander.velocity.y < 0) // Slow down for landing
+    // Enhanced landing logic for final approach
+    val finalApproach = distanceToGoal < approachDistance
+    val needToSlowDown = (distanceToGoal < preApproachDistance && currentSpeed > maxSafeLandingVelocity * 2) || 
+                         (finalApproach && currentSpeed > maxSafeLandingVelocity)
 
-    val left = desiredDirection.x < 0 && lander.velocity.x > -15.0 // Go left if needed and not too fast
-    val right = desiredDirection.x > 0 && lander.velocity.x < 15.0 // Go right if needed and not too fast
+    // Calculate acceleration based on desired direction and current velocity
+    val up = if (finalApproach) {
+        // When in final approach, use thrusters to carefully control speed
+        val wasGoingUp = previousAcceleration.up
+        val isGoingDown = averageVelocity.y < 0
+        val isTooFast = currentSpeed > maxSafeLandingVelocity
 
-    return Acceleration(up = up, left = left, right = right)
+        // Smooth control by considering previous acceleration
+        if (wasGoingUp && !isGoingDown && !isTooFast) {
+            // Continue going up if we were already going up and not going too fast
+            true
+        } else if (isGoingDown && isTooFast) {
+            // Counter downward movement if going too fast
+            true
+        } else if (desiredDirection.y > 0 && averageVelocity.y < maxSafeLandingVelocity / 2) {
+            // Gentle upward adjustment if needed
+            true
+        } else {
+            // Otherwise, don't accelerate up
+            false
+        }
+    } else {
+        // Normal flight mode with smoother control
+        (desiredDirection.y > 0 && averageVelocity.y < 20.0) || // Accelerate up if we need to go up
+        (averageVelocity.y < -10.0) || // Counter gravity if falling too fast
+        (needToSlowDown && averageVelocity.y < 0) // Slow down for landing
+    }
+
+    // Horizontal control logic with smoother transitions
+    val left = if (finalApproach) {
+        // When in final approach, be more conservative with horizontal movement
+        val wasGoingLeft = previousAcceleration.left
+        val isGoingRight = averageVelocity.x > 0
+        val isTooFast = abs(averageVelocity.x) > maxSafeLandingVelocity / 2
+
+        if (wasGoingLeft && !isGoingRight && !isTooFast) {
+            // Continue going left if we were already going left and not going too fast
+            true
+        } else {
+            // Otherwise, only go left if needed and not too fast
+            desiredDirection.x < 0 && averageVelocity.x > -maxSafeLandingVelocity / 2
+        }
+    } else {
+        // Normal flight mode
+        desiredDirection.x < 0 && averageVelocity.x > -15.0 // Go left if needed and not too fast
+    }
+
+    val right = if (finalApproach) {
+        // When in final approach, be more conservative with horizontal movement
+        val wasGoingRight = previousAcceleration.right
+        val isGoingLeft = averageVelocity.x < 0
+        val isTooFast = abs(averageVelocity.x) > maxSafeLandingVelocity / 2
+
+        if (wasGoingRight && !isGoingLeft && !isTooFast) {
+            // Continue going right if we were already going right and not going too fast
+            true
+        } else {
+            // Otherwise, only go right if needed and not too fast
+            desiredDirection.x > 0 && averageVelocity.x < maxSafeLandingVelocity / 2
+        }
+    } else {
+        // Normal flight mode
+        desiredDirection.x > 0 && averageVelocity.x < 15.0 // Go right if needed and not too fast
+    }
+
+    // Create and store the new acceleration
+    val acceleration = Acceleration(up = up, left = left, right = right)
+    accelerationHistory.add(acceleration)
+    if (accelerationHistory.size > HISTORY_SIZE) {
+        accelerationHistory.removeAt(0)
+    }
+
+    // Update previous values for next call
+    previousAcceleration = acceleration
+    previousVelocity = lander.velocity
+
+    return acceleration
 }
 
 /**
