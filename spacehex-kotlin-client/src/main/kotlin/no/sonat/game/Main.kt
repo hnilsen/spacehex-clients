@@ -83,8 +83,8 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
 
     // Determine desired direction based on approach strategy and obstacles
     val desiredDirection = if (obstacleAvoidanceVector != Vec2D.ZERO) {
-        // If there's an obstacle, prioritize avoiding it
-        (toGoal.unit() + obstacleAvoidanceVector * 2.0).unit()
+        // If there's an obstacle, prioritize avoiding it with higher weight
+        (toGoal.unit() + obstacleAvoidanceVector * 4.0).unit()
     } else if (approachFromAbove && lander.position.y < env.goal.y && distanceToGoal > approachDistance) {
         // If we're below the goal and not in final approach, aim above the goal
         val aboveGoal = Vec2D(env.goal.x, env.goal.y + 5.0)
@@ -122,12 +122,12 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
         }
     } else {
         // Normal flight mode with smoother control
-        (desiredDirection.y > 0 && averageVelocity.y < 20.0) || // Accelerate up if we need to go up
-        (averageVelocity.y < -10.0) || // Counter gravity if falling too fast
+        (desiredDirection.y > 0 && averageVelocity.y < env.constants.landerAccelerationUp) || // Accelerate up if we need to go up
+        (averageVelocity.y < -env.constants.gravity) || // Counter gravity if falling too fast
         (needToSlowDown && averageVelocity.y < 0) // Slow down for landing
     }
 
-    // Horizontal control logic with smoother transitions
+    // Horizontal control logic with more aggressive movement
     val left = if (finalApproach) {
         // When in final approach, be more conservative with horizontal movement
         val wasGoingLeft = previousAcceleration.left
@@ -142,8 +142,12 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
             desiredDirection.x < 0 && averageVelocity.x > -maxSafeLandingVelocity / 2
         }
     } else {
-        // Normal flight mode
-        desiredDirection.x < 0 && averageVelocity.x > -15.0 // Go left if needed and not too fast
+        // Normal flight mode - more aggressive horizontal movement
+        // Allow higher horizontal velocity (2x the acceleration constant) for better obstacle avoidance
+        desiredDirection.x < 0 && (
+            averageVelocity.x > -env.constants.landerAccelerationLeft * 2 || // Allow higher speed for obstacle avoidance
+            obstacleAvoidanceVector.x < -0.3 // Force left if obstacle avoidance strongly suggests it
+        )
     }
 
     val right = if (finalApproach) {
@@ -160,8 +164,12 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
             desiredDirection.x > 0 && averageVelocity.x < maxSafeLandingVelocity / 2
         }
     } else {
-        // Normal flight mode
-        desiredDirection.x > 0 && averageVelocity.x < 15.0 // Go right if needed and not too fast
+        // Normal flight mode - more aggressive horizontal movement
+        // Allow higher horizontal velocity (2x the acceleration constant) for better obstacle avoidance
+        desiredDirection.x > 0 && (
+            averageVelocity.x < env.constants.landerAccelerationRight * 2 || // Allow higher speed for obstacle avoidance
+            obstacleAvoidanceVector.x > 0.3 // Force right if obstacle avoidance strongly suggests it
+        )
     }
 
     // Create and store the new acceleration
@@ -190,23 +198,40 @@ fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
     val velocity = lander.velocity
 
     // Look ahead based on current velocity to predict future position
-    val lookAheadDistance = velocity.length() * 1.5
+    // Use a minimum lookAheadDistance to ensure we detect obstacles even when moving slowly
+    val minLookAheadDistance = 10.0
+    val velocityBasedDistance = velocity.length() * 3.0
+    val lookAheadDistance = maxOf(minLookAheadDistance, velocityBasedDistance)
+
+    // Consider gravity in our prediction by adding a downward component
+    val gravityAdjustedVelocity = velocity + Vec2D(0.0, -env.constants.gravity * 0.5)
     val predictedPath = LineSegment2D(
         position, 
-        position + velocity.unit() * lookAheadDistance
+        position + gravityAdjustedVelocity.unit() * lookAheadDistance
+    )
+
+    // Add a second prediction path directly below for ground detection
+    val groundDetectionPath = LineSegment2D(
+        position,
+        position + Vec2D(0.0, -minLookAheadDistance)
     )
 
     // Check for potential collisions with ground segments
     var closestIntersection: Vec2D? = null
     var minDistance = Double.MAX_VALUE
 
-    for (segment in env.segments) {
-        val intersection = predictedPath.intersects(segment)
-        if (intersection != null) {
-            val distance = (intersection - position).length()
-            if (distance < minDistance) {
-                minDistance = distance
-                closestIntersection = intersection
+    // Check both the velocity-based path and the ground detection path
+    val pathsToCheck = listOf(predictedPath, groundDetectionPath)
+
+    for (path in pathsToCheck) {
+        for (segment in env.segments) {
+            val intersection = path.intersects(segment)
+            if (intersection != null) {
+                val distance = (intersection - position).length()
+                if (distance < minDistance) {
+                    minDistance = distance
+                    closestIntersection = intersection
+                }
             }
         }
     }
@@ -235,8 +260,16 @@ fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
             val toPosition = position - closestSegment.closestPoint(position)
             val dotProduct = normal.dot(toPosition)
 
-            // Return normalized avoidance vector
-            return if (dotProduct >= 0) normal else -normal
+            // Get the basic avoidance vector
+            val basicAvoidance = if (dotProduct >= 0) normal else -normal
+
+            // If the segment is below us (ground), add a strong upward component
+            // to ensure we prioritize moving up to avoid ground collisions
+            if (closestSegment.closestPoint(position).y < position.y) {
+                return (basicAvoidance + Vec2D(0.0, 2.0)).unit()
+            }
+
+            return basicAvoidance
         }
     }
 
