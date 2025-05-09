@@ -99,6 +99,9 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
     val needToSlowDown = (distanceToGoal < preApproachDistance && currentSpeed > maxSafeLandingVelocity * 2) || 
                          (finalApproach && currentSpeed > maxSafeLandingVelocity)
 
+    // Check if the obstacle avoidance vector indicates a mountain
+    val isMountainAhead = obstacleAvoidanceVector != Vec2D.ZERO && obstacleAvoidanceVector.y > 0.5
+
     // Calculate acceleration based on desired direction and current velocity
     val up = if (finalApproach) {
         // When in final approach, use thrusters to carefully control speed
@@ -120,6 +123,10 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
             // Otherwise, don't accelerate up
             false
         }
+    } else if (isMountainAhead) {
+        // Mountain climbing mode - maintain strong upward thrust
+        // Continue thrusting up until we have significant upward velocity
+        true
     } else {
         // Normal flight mode with smoother control
         (desiredDirection.y > 0 && averageVelocity.y < env.constants.landerAccelerationUp) || // Accelerate up if we need to go up
@@ -141,6 +148,17 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
             // Otherwise, only go left if needed and not too fast
             desiredDirection.x < 0 && averageVelocity.x > -maxSafeLandingVelocity / 2
         }
+    } else if (isMountainAhead) {
+        // When climbing a mountain, be more conservative with horizontal movement
+        // to focus on gaining altitude rather than horizontal movement
+
+        // Only go left if strongly needed and not already moving right too fast
+        val isGoingRightTooFast = averageVelocity.x > env.constants.landerAccelerationRight
+
+        // If obstacle avoidance strongly suggests left, or if we need to go left to reach the goal
+        // and we're not already moving right too fast
+        (obstacleAvoidanceVector.x < -0.5) || 
+        (desiredDirection.x < -0.7 && !isGoingRightTooFast)
     } else {
         // Normal flight mode - more aggressive horizontal movement
         // Allow higher horizontal velocity (2x the acceleration constant) for better obstacle avoidance
@@ -163,6 +181,17 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
             // Otherwise, only go right if needed and not too fast
             desiredDirection.x > 0 && averageVelocity.x < maxSafeLandingVelocity / 2
         }
+    } else if (isMountainAhead) {
+        // When climbing a mountain, be more conservative with horizontal movement
+        // to focus on gaining altitude rather than horizontal movement
+
+        // Only go right if strongly needed and not already moving left too fast
+        val isGoingLeftTooFast = averageVelocity.x < -env.constants.landerAccelerationLeft
+
+        // If obstacle avoidance strongly suggests right, or if we need to go right to reach the goal
+        // and we're not already moving left too fast
+        (obstacleAvoidanceVector.x > 0.5) || 
+        (desiredDirection.x > 0.7 && !isGoingLeftTooFast)
     } else {
         // Normal flight mode - more aggressive horizontal movement
         // Allow higher horizontal velocity (2x the acceleration constant) for better obstacle avoidance
@@ -196,15 +225,19 @@ fun calculateAcceleration(env: Environment, lander: Lander): Acceleration {
 fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
     val position = lander.position
     val velocity = lander.velocity
+    val toGoal = env.goal - position
+    val distanceToGoal = toGoal.length()
 
     // Look ahead based on current velocity to predict future position
-    // Use a minimum lookAheadDistance to ensure we detect obstacles even when moving slowly
-    val minLookAheadDistance = 10.0
-    val velocityBasedDistance = velocity.length() * 3.0
+    // Use a larger minimum lookAheadDistance to detect mountains earlier
+    val minLookAheadDistance = 20.0
+    val velocityBasedDistance = velocity.length() * 4.0
     val lookAheadDistance = maxOf(minLookAheadDistance, velocityBasedDistance)
 
     // Consider gravity in our prediction by adding a downward component
     val gravityAdjustedVelocity = velocity + Vec2D(0.0, -env.constants.gravity * 0.5)
+
+    // Create a path in the direction of travel
     val predictedPath = LineSegment2D(
         position, 
         position + gravityAdjustedVelocity.unit() * lookAheadDistance
@@ -216,14 +249,30 @@ fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
         position + Vec2D(0.0, -minLookAheadDistance)
     )
 
+    // Add a path that looks upward at an angle to detect mountains ahead
+    val upwardDetectionPath = LineSegment2D(
+        position,
+        position + Vec2D(toGoal.x, maxOf(toGoal.y, 15.0)).unit() * lookAheadDistance
+    )
+
+    // Add a path directly toward the goal to check if there are obstacles in the way
+    val directGoalPath = LineSegment2D(
+        position,
+        position + toGoal.unit() * minOf(distanceToGoal, lookAheadDistance)
+    )
+
     // Check for potential collisions with ground segments
     var closestIntersection: Vec2D? = null
     var minDistance = Double.MAX_VALUE
+    var isMountain = false
 
-    // Check both the velocity-based path and the ground detection path
-    val pathsToCheck = listOf(predictedPath, groundDetectionPath)
+    // Check all paths for intersections
+    val pathsToCheck = listOf(predictedPath, groundDetectionPath, upwardDetectionPath, directGoalPath)
 
-    for (path in pathsToCheck) {
+    // Track which path had the intersection
+    var intersectionPathIndex = -1
+
+    for ((index, path) in pathsToCheck.withIndex()) {
         for (segment in env.segments) {
             val intersection = path.intersects(segment)
             if (intersection != null) {
@@ -231,6 +280,7 @@ fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
                 if (distance < minDistance) {
                     minDistance = distance
                     closestIntersection = intersection
+                    intersectionPathIndex = index
                 }
             }
         }
@@ -263,9 +313,20 @@ fun calculateObstacleAvoidance(env: Environment, lander: Lander): Vec2D {
             // Get the basic avoidance vector
             val basicAvoidance = if (dotProduct >= 0) normal else -normal
 
-            // If the segment is below us (ground), add a strong upward component
-            // to ensure we prioritize moving up to avoid ground collisions
-            if (closestSegment.closestPoint(position).y < position.y) {
+            // Determine if this is likely a mountain (obstacle between us and goal)
+            // Check if the segment is in the general direction of the goal
+            val segmentToGoalAngle = abs(toGoal.unit().dot(segmentDirection))
+
+            // If intersection was on the upward or direct goal path, it's likely a mountain
+            isMountain = intersectionPathIndex == 2 || intersectionPathIndex == 3 || 
+                         (segmentToGoalAngle > 0.5 && closestSegment.closestPoint(position).y > position.y)
+
+            // If it's a mountain or the segment is below us (ground), add a strong upward component
+            if (isMountain) {
+                // For mountains, use a very strong upward component to climb over
+                return (basicAvoidance + Vec2D(0.0, 4.0)).unit()
+            } else if (closestSegment.closestPoint(position).y < position.y) {
+                // For ground, use a moderate upward component
                 return (basicAvoidance + Vec2D(0.0, 2.0)).unit()
             }
 
